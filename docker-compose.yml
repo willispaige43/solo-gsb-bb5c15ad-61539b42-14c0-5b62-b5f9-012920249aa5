@@ -1,0 +1,13 @@
+services:
+  cidr-api:
+    build: .
+    image: cidr-lease-api:latest
+    container_name: cidr-lease-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - cidr-data:/data
+    restart: unless-stopped
+
+volumes:
+  cidr-data:
