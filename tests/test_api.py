@@ -485,6 +485,233 @@ def test_resize_ipv6(client):
     _assert_chain_linkage(events)
 
 
+# ---------- lease migration across pools ----------
+
+def test_migrate_picks_smallest_block_and_releases_source(client):
+    src = _create_pool(client, "src", "10.0.0.0/24")
+    dst = _create_pool(client, "dst", "192.168.0.0/24")
+    # block the lowest /27 in the target so migration must pick .32
+    client.post(f"/pools/{dst}/reservations", json={"cidr": "192.168.0.0/27"})
+
+    lease = client.post(
+        f"/pools/{src}/leases", json={"prefix_len": 27, "ttl_seconds": 3600}
+    ).json()
+    assert lease["cidr"] == "10.0.0.0/27"
+
+    r = client.post(
+        f"/leases/{lease['token']}/migrate", json={"target_pool_id": dst}
+    )
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["cidr"] == "192.168.0.32/27"  # smallest free aligned block
+    assert out["pool_id"] == dst
+    assert out["id"] == lease["id"]  # identity kept
+    assert out["token"] == lease["token"]
+    assert out["expires_at"] == lease["expires_at"]
+    assert out["status"] == "active"
+
+    # same token, now in the target pool
+    assert client.get(f"/leases/{lease['token']}").json()["pool_id"] == dst
+    # source block released immediately: the source pool is fully free again
+    ov = client.get(f"/pools/{src}").json()
+    assert ov["free_cidrs"] == ["10.0.0.0/24"]
+    assert ov["active_leases"] == []
+    # and that space can be handed out again
+    r = client.post(f"/pools/{src}/leases", json={"prefix_len": 26})
+    assert r.status_code == 201
+    assert r.json()["cidr"] == "10.0.0.0/26"
+    # target occupancy reflects the migrated lease
+    ov = client.get(f"/pools/{dst}").json()
+    assert [l["cidr"] for l in ov["active_leases"]] == ["192.168.0.32/27"]
+    assert ov["free_cidrs"][0] == "192.168.0.64/26"
+
+
+def test_migrate_audit_event(client):
+    src = _create_pool(client, "src", "10.0.0.0/24")
+    dst = _create_pool(client, "dst", "192.168.0.0/24")
+    lease = client.post(
+        f"/pools/{src}/leases", json={"prefix_len": 28, "ttl_seconds": 3600}
+    ).json()
+    assert client.post(
+        f"/leases/{lease['token']}/migrate", json={"target_pool_id": dst}
+    ).status_code == 200
+
+    events = client.get("/audit/events").json()
+    assert [e["action"] for e in events] == ["allocate", "migrate"]
+    event = events[1]
+    assert event["lease_id"] == lease["id"]
+    assert event["pool_id"] == dst  # event cidr/pool use the destination
+    assert event["cidr"] == "192.168.0.0/28"
+    assert event["details"] == {
+        "source_pool_id": src,
+        "target_pool_id": dst,
+        "before_cidr": "10.0.0.0/28",
+        "after_cidr": "192.168.0.0/28",
+    }
+    assert lease["token"] not in str(event)
+    _assert_chain_linkage(events)
+    assert client.get("/audit/verify").json() == {"valid": True, "invalid_seq": None}
+
+
+def test_migrate_same_pool_422(client):
+    src = _create_pool(client, "src", "10.0.0.0/24")
+    lease = client.post(f"/pools/{src}/leases", json={"prefix_len": 28}).json()
+    r = client.post(
+        f"/leases/{lease['token']}/migrate", json={"target_pool_id": src}
+    )
+    assert r.status_code == 422
+    # lease and both pools untouched, no event
+    assert client.get(f"/leases/{lease['token']}").json() == lease
+    assert [e["action"] for e in client.get("/audit/events").json()] == ["allocate"]
+
+
+def test_migrate_address_family_mismatch_422(client):
+    src = _create_pool(client, "src", "10.0.0.0/24")
+    v6 = _create_pool(client, "v6", "2001:db8::/32")
+    lease = client.post(f"/pools/{src}/leases", json={"prefix_len": 28}).json()
+    r = client.post(
+        f"/leases/{lease['token']}/migrate", json={"target_pool_id": v6}
+    )
+    assert r.status_code == 422
+    assert client.get(f"/leases/{lease['token']}").json() == lease
+    assert [e["action"] for e in client.get("/audit/events").json()] == ["allocate"]
+
+
+def test_migrate_body_and_reference_validation(client):
+    src = _create_pool(client, "src", "10.0.0.0/24")
+    lease = client.post(f"/pools/{src}/leases", json={"prefix_len": 28}).json()
+    # missing body / field -> 422
+    assert client.post(f"/leases/{lease['token']}/migrate").status_code == 422
+    assert client.post(f"/leases/{lease['token']}/migrate", json={}).status_code == 422
+    # non-integer pool id -> 422
+    assert client.post(
+        f"/leases/{lease['token']}/migrate", json={"target_pool_id": "x"}
+    ).status_code == 422
+    # unknown token -> 404; nonexistent target pool -> 404
+    assert client.post(
+        "/leases/nope/migrate", json={"target_pool_id": src}
+    ).status_code == 404
+    assert client.post(
+        f"/leases/{lease['token']}/migrate", json={"target_pool_id": 999}
+    ).status_code == 404
+
+
+def test_migrate_released_lease_409(client):
+    src = _create_pool(client, "src", "10.0.0.0/24")
+    dst = _create_pool(client, "dst", "192.168.0.0/24")
+    lease = client.post(f"/pools/{src}/leases", json={"prefix_len": 28}).json()
+    client.post(f"/leases/{lease['token']}/release")
+    r = client.post(
+        f"/leases/{lease['token']}/migrate", json={"target_pool_id": dst}
+    )
+    assert r.status_code == 409
+    assert client.get(f"/leases/{lease['token']}").json()["pool_id"] == src
+    assert [e["action"] for e in client.get("/audit/events").json()] == [
+        "allocate",
+        "release",
+    ]
+
+
+def test_migrate_expired_lease_409(client):
+    src = _create_pool(client, "src", "10.0.0.0/24")
+    dst = _create_pool(client, "dst", "192.168.0.0/24")
+    lease = client.post(
+        f"/pools/{src}/leases", json={"prefix_len": 28, "ttl_seconds": 1}
+    ).json()
+    time.sleep(1.2)
+    assert client.post(
+        f"/leases/{lease['token']}/migrate", json={"target_pool_id": dst}
+    ).status_code == 409
+    # failed tx rolled back: no migrate event and the lease stays on the source
+    events = client.get("/audit/events").json()
+    assert [e["action"] for e in events] == ["allocate"]
+    assert client.get(f"/leases/{lease['token']}").json()["pool_id"] == src
+
+
+def test_migrate_no_space_409_leaves_both_pools_unchanged(client):
+    src = _create_pool(client, "src", "10.0.0.0/24")
+    dst = _create_pool(client, "dst", "192.168.0.0/30")
+    lease = client.post(
+        f"/pools/{src}/leases", json={"prefix_len": 30, "ttl_seconds": 3600}
+    ).json()
+    # fill the target completely with two /31 leases
+    client.post(f"/pools/{dst}/leases", json={"prefix_len": 31})
+    client.post(f"/pools/{dst}/leases", json={"prefix_len": 31})
+
+    r = client.post(
+        f"/leases/{lease['token']}/migrate", json={"target_pool_id": dst}
+    )
+    assert r.status_code == 409
+
+    # source: lease still active in place, block still occupied
+    cur = client.get(f"/leases/{lease['token']}").json()
+    assert cur == lease
+    assert client.get(f"/pools/{src}").json()["free_cidrs"] == [
+        "10.0.0.4/30",
+        "10.0.0.8/29",
+        "10.0.0.16/28",
+        "10.0.0.32/27",
+        "10.0.0.64/26",
+        "10.0.0.128/25",
+    ]
+    # target: still fully consumed by its two leases
+    assert client.get(f"/pools/{dst}").json()["free_cidrs"] == []
+    # no migrate event; chain intact
+    actions = [e["action"] for e in client.get("/audit/events").json()]
+    assert actions == ["allocate", "allocate", "allocate"]
+    assert client.get("/audit/verify").json() == {"valid": True, "invalid_seq": None}
+
+
+def test_migrate_prefix_does_not_fit_target_409(client):
+    src = _create_pool(client, "src", "10.0.0.0/24")
+    dst = _create_pool(client, "dst", "192.168.0.0/30")
+    lease = client.post(f"/pools/{src}/leases", json={"prefix_len": 24}).json()
+    r = client.post(
+        f"/leases/{lease['token']}/migrate", json={"target_pool_id": dst}
+    )
+    assert r.status_code == 409
+    assert client.get(f"/leases/{lease['token']}").json() == lease
+
+
+def test_migrate_ipv6(client):
+    src = _create_pool(client, "src", "2001:db8::/32")
+    dst = _create_pool(client, "dst", "2001:db9::/32")
+    client.post(f"/pools/{dst}/reservations", json={"cidr": "2001:db9::/48"})
+    lease = client.post(f"/pools/{src}/leases", json={"prefix_len": 64}).json()
+    assert lease["cidr"] == "2001:db8::/64"
+
+    r = client.post(
+        f"/leases/{lease['token']}/migrate", json={"target_pool_id": dst}
+    )
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["cidr"] == "2001:db9:1::/64"
+    assert out["id"] == lease["id"]
+    assert out["token"] == lease["token"]
+    assert out["expires_at"] == lease["expires_at"]
+    ov = client.get(f"/pools/{src}").json()
+    assert ov["free_cidrs"][0] == "2001:db8::/32"
+    assert ov["active_leases"] == []
+
+
+def test_migrate_then_renew_keeps_target(client):
+    src = _create_pool(client, "src", "10.0.0.0/24")
+    dst = _create_pool(client, "dst", "192.168.0.0/24")
+    lease = client.post(
+        f"/pools/{src}/leases", json={"prefix_len": 28, "ttl_seconds": 3600}
+    ).json()
+    assert client.post(
+        f"/leases/{lease['token']}/migrate", json={"target_pool_id": dst}
+    ).status_code == 200
+    # renew follows its normal now+ttl rule but stays on the target pool
+    r = client.post(f"/leases/{lease['token']}/renew", json={"ttl_seconds": 7200})
+    assert r.status_code == 200
+    out = r.json()
+    assert out["pool_id"] == dst
+    assert out["cidr"] == "192.168.0.0/28"
+    assert out["expires_at"] >= lease["expires_at"] + 3599
+
+
 # ---------- lease handoffs ----------
 
 def _create_lease(client, cidr="10.0.0.0/24", prefix_len=27, ttl=3600):

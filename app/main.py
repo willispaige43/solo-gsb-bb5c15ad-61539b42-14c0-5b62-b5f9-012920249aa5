@@ -17,6 +17,7 @@ from .schemas import (
     HandoffOut,
     LeaseOut,
     LeaseRequest,
+    MigrateRequest,
     PoolCreate,
     PoolOut,
     PoolOverview,
@@ -136,6 +137,14 @@ def resize_lease(
 ) -> dict:
     with write_tx(db):
         return service.resize_lease(db, token, body.target_prefix_len)
+
+
+@app.post("/leases/{token}/migrate", response_model=LeaseOut)
+def migrate_lease(
+    token: str, body: MigrateRequest, db: sqlite3.Connection = Depends(get_db)
+) -> dict:
+    with write_tx(db):
+        return service.migrate_lease(db, token, body.target_pool_id)
 
 
 # ---------- lease handoffs ----------

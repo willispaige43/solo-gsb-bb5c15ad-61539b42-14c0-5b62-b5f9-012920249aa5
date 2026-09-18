@@ -2,7 +2,7 @@
 
 基于 **Python + FastAPI + SQLite + 标准库 `ipaddress`** 的本地 CIDR 地址租约服务。
 支持 IPv4 / IPv6 地址池、保留网段、事务化租约分配、续租/释放、过期自动回收、
-租约控制权交接（一次性领取码），空闲空间的最简 CIDR 集合查询，
+租约跨池迁移、租约控制权交接（一次性领取码），空闲空间的最简 CIDR 集合查询，
 以及哈希链式租约审计日志。
 
 ## 快速启动（单条命令）
@@ -51,6 +51,25 @@ docker compose up -d --build
   `resize` 审计事件都在**同一个 `BEGIN IMMEDIATE` 事务**内完成，
   失败整体回滚、不留事件。
 
+## 租约跨池迁移
+
+`POST /leases/{token}/migrate`，请求体 `{"target_pool_id": <int>}`，把一个
+活动租约从当前地址池**整体迁移**到另一个池：
+
+- 仅**活动租约**可迁移；已释放/过期租约返回 `409`，未知令牌返回 `404`。
+- 源池与目标池**必须不同**，且**地址族一致**（同为 IPv4 或同为 IPv6），
+  否则返回 `422`；目标池不存在返回 `404`。
+- 新网段取租约**当前前缀长度**在目标池空闲空间中**起始地址最小**的合法 CIDR；
+  目标池无容纳空间返回 `409`。
+- 迁移在**同一个 `BEGIN IMMEDIATE` 事务**内完成：过期清理、两池占用计算、
+  租约行更新与追加 `migrate` 审计事件一并提交，**失败整体回滚，两池状态均
+  不改变、不留事件**。
+- 迁移成功后：租约 **`id`、`token`、`expires_at` 保持不变**，源网段**立即释放**
+  回源池（可马上再分配），租约归属目标池、持有新网段。
+- 成功时追加一条 `migrate` 审计事件：事件 `pool_id`/`cidr` 使用**目标池与目标
+  网段**，`details` 记录 `source_pool_id`、`target_pool_id`、`before_cidr`、
+  `after_cidr`。
+
 ## 租约控制权交接
 
 两步即可把租约控制权移交给另一方，无需让对方知晓旧令牌（服务监听 **8000 端口**）：
@@ -85,6 +104,7 @@ docker compose up -d --build
 | POST | `/leases/{token}/renew` | 续租 |
 | POST | `/leases/{token}/release` | 主动释放 |
 | PUT | `/leases/{token}/resize` | 原地缩/扩容（仅活动租约） |
+| POST | `/leases/{token}/migrate` | 跨池迁移（同族不同池，保留 id/token/到期时间） |
 | POST | `/leases/{token}/handoffs` | 签发租约交接码（有效期 1~3600 秒，默认 300） |
 | POST | `/lease-handoffs/{claim_code}/claim` | 凭交接码领取租约（轮换 token） |
 | GET | `/audit/events` | 按 `seq` 升序列出租约审计事件 |
@@ -134,12 +154,17 @@ curl -s -X PUT http://localhost:8000/leases/<TOKEN>/resize \
 curl -s -X PUT http://localhost:8000/leases/<TOKEN>/resize \
   -H 'Content-Type: application/json' -d '{"target_prefix_len":29}'
 
-# 6d) 交接第一步：持有方为活动租约签发交接码（有效期 600 秒）
+# 6d) 跨池迁移到池 2（同族不同池；id/token/到期时间不变，源网段立即释放）
+curl -s -X POST http://localhost:8000/leases/<TOKEN>/migrate \
+  -H 'Content-Type: application/json' -d '{"target_pool_id":2}'
+# {"id":1,...,"pool_id":2,"cidr":"192.168.0.0/29",...,"token":"<TOKEN>",...}
+
+# 6e) 交接第一步：持有方为活动租约签发交接码（有效期 600 秒）
 curl -s -X POST http://localhost:8000/leases/<TOKEN>/handoffs \
   -H 'Content-Type: application/json' -d '{"ttl_seconds":600}'
 # {"claim_code":"<CLAIM_CODE>","expires_at":...}
 
-# 6e) 交接第二步：接收方凭交接码领取租约（token 轮换，CIDR/到期时间不变）
+# 6f) 交接第二步：接收方凭交接码领取租约（token 轮换，CIDR/到期时间不变）
 curl -s -X POST http://localhost:8000/lease-handoffs/<CLAIM_CODE>/claim
 # {"id":1,...,"token":"<NEW_TOKEN>",...}  —— 旧 TOKEN 此后按未知令牌返回 404
 
@@ -165,8 +190,8 @@ curl -s -X POST http://localhost:8000/pools/2/leases \
 
 ## 租约审计链
 
-租约**分配、续租、释放、过期回收、缩扩容、控制权交接**成功时，会在**同一个
-`BEGIN IMMEDIATE` 事务**内向 `audit_events` 表追加一条事件；操作失败
+租约**分配、续租、释放、过期回收、缩扩容、跨池迁移、控制权交接**成功时，会在
+**同一个 `BEGIN IMMEDIATE` 事务**内向 `audit_events` 表追加一条事件；操作失败
 （409/422/404 等）事务回滚，**不会留下任何事件**。
 
 每条事件包含：
@@ -174,11 +199,11 @@ curl -s -X POST http://localhost:8000/pools/2/leases \
 | 字段 | 说明 |
 |---|---|
 | `seq` | 从 1 开始连续递增的序号（写锁内分配，并发安全） |
-| `action` | `allocate` / `renew` / `release` / `expire` / `resize` / `handoff` |
-| `lease_id` / `pool_id` | 租约与地址池标识 |
-| `cidr` | 租约网段（`resize` 事件为变更后的网段） |
+| `action` | `allocate` / `renew` / `release` / `expire` / `resize` / `migrate` / `handoff` |
+| `lease_id` / `pool_id` | 租约与地址池标识（`migrate` 事件为目标池） |
+| `cidr` | 租约网段（`resize` 事件为变更后的网段；`migrate` 事件为目标网段） |
 | `occurred_at` | 事件时间（Unix 秒） |
-| `details` | 详情 JSON（如 `prefix_len`、`ttl_seconds`、`expires_at`；`resize` 事件记录 `before_cidr` / `after_cidr`） |
+| `details` | 详情 JSON（如 `prefix_len`、`ttl_seconds`、`expires_at`；`resize` 事件记录 `before_cidr` / `after_cidr`；`migrate` 事件记录源/目标池 ID 与迁移前后 CIDR） |
 | `prev_hash` | 上一条事件的 `hash`；首条为 64 个 `0` |
 | `hash` | 本事件摘要 |
 
@@ -210,7 +235,11 @@ pytest -q
 缩扩容覆盖：缩容保留低地址子网且 token/到期时间不变、扩容取唯一超网、
 扩容与活动租约/保留段/池边界冲突 409、非法前缀 422、同前缀幂等不写事件、
 非活动租约 409、IPv6 双向调整。
-审计链覆盖：五类事件记录与哈希链接、失败操作不记录、过期回收事件、
+跨池迁移覆盖：起始地址最小选取、源网段立即释放可再分配、保留 id/token/
+到期时间、同池 422、族不一致 422、目标池不存在 404、请求体校验 422、
+目标无空间/前缀放不下 409 且两池状态不变、已释放/已过期租约 409、
+失败不写事件、IPv6、迁移后续租仍归属目标池、`migrate` 审计事件与链完整性。
+审计链覆盖：各类事件记录与哈希链接、失败操作不记录、过期回收事件、
 空链有效，以及篡改事件内容 / 破坏 `prev_hash` 链接时 `verify` 能定位首个失效 `seq`。
 交接覆盖：签发 TTL 边界（1~3600，默认 300）、重复签发使旧码失效、领取轮换 token
 且 CIDR/到期时间不变、旧 token 按未知令牌 404、过期/已消费/被替换/租约非活动 409、

@@ -42,6 +42,10 @@ class ResizeRequest(BaseModel):
     target_prefix_len: int = Field(..., ge=0, le=128, examples=[26])
 
 
+class MigrateRequest(BaseModel):
+    target_pool_id: int = Field(..., examples=[2])
+
+
 class HandoffCreate(BaseModel):
     ttl_seconds: int | None = Field(None, ge=1, le=3600, examples=[300])
 

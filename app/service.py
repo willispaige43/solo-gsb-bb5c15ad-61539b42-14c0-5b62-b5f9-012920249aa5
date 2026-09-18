@@ -432,6 +432,82 @@ def resize_lease(
     return _lease_row_to_dict(row)
 
 
+def migrate_lease(
+    conn: sqlite3.Connection, token: str, target_pool_id: int
+) -> dict:
+    """Move an active lease to another pool of the same address family.
+
+    The lease keeps its id, token and expires_at; it re-acquires the same
+    prefix length at the smallest-start free CIDR of the target pool. The
+    source block is released the instant the lease row moves (both pools are
+    touched inside one BEGIN IMMEDIATE transaction).
+    """
+    now = _now()
+    row = _find_lease(conn, token)
+
+    if target_pool_id == row["pool_id"]:
+        raise ApiError(422, "target_pool_id must differ from the lease's pool")
+
+    target_pool = _get_pool(conn, target_pool_id)
+    source_pool = _get_pool(conn, row["pool_id"])
+    if target_pool["version"] != source_pool["version"]:
+        raise ApiError(
+            422,
+            f"target pool '{target_pool['name']}' is IPv{target_pool['version']} "
+            f"but the lease is IPv{source_pool['version']}",
+        )
+
+    # Locks are pool-scoped; sweep both pools so the liveness check and the
+    # target occupancy calculation are authoritative.
+    _sweep_pool(conn, row["pool_id"], now)
+    _sweep_pool(conn, target_pool_id, now)
+    row = _find_lease(conn, token)
+    _require_live(row, now)
+
+    prefix_len = int(row["cidr"].split("/")[1])
+    max_prefix = 32 if target_pool["version"] == 4 else 128
+    occupied = _reservation_occupancy(conn, target_pool_id) + _active_lease_occupancy(
+        conn, target_pool_id, now
+    )
+    free = free_intervals(
+        int(target_pool["start_addr"]), int(target_pool["end_addr"]), occupied
+    )
+    picked = smallest_subnet(free, prefix_len, max_prefix)
+    if picked is None:
+        raise ApiError(
+            409,
+            f"no free /{prefix_len} block available in pool "
+            f"{target_pool['cidr']}",
+        )
+
+    new_start, new_end = picked
+    new_cidr = collapse([(new_start, new_end)], target_pool["version"])[0]
+    before_cidr = row["cidr"]
+    source_pool_id = row["pool_id"]
+
+    conn.execute(
+        "UPDATE leases SET pool_id = ?, cidr = ?, start_addr = ?, end_addr = ? "
+        "WHERE id = ?",
+        (target_pool_id, new_cidr, str(new_start), str(new_end), row["id"]),
+    )
+    audit.append_event(
+        conn,
+        action=audit.MIGRATE,
+        lease_id=row["id"],
+        pool_id=target_pool_id,
+        cidr=new_cidr,
+        occurred_at=now,
+        details={
+            "source_pool_id": source_pool_id,
+            "target_pool_id": target_pool_id,
+            "before_cidr": before_cidr,
+            "after_cidr": new_cidr,
+        },
+    )
+    row = conn.execute("SELECT * FROM leases WHERE id = ?", (row["id"],)).fetchone()
+    return _lease_row_to_dict(row)
+
+
 # ---------- lease handoffs ----------
 
 HANDOFF_DEFAULT_TTL_SECONDS = 300
